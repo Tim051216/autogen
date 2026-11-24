@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from dataclasses import dataclass
 
 import pytest
@@ -158,3 +159,68 @@ async def test_nested_cancellation_inner_called() -> None:
     long_running_agent = await runtime.try_get_underlying_agent_instance(long_running_id, type=LongRunningAgent)
     assert long_running_agent.called
     assert long_running_agent.cancelled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_before_link", [False, True])
+async def test_link_future_cancellation_is_thread_safe(cancel_before_link: bool) -> None:
+    loop = asyncio.get_running_loop()
+    was_debug = loop.get_debug()
+    loop.set_debug(True)
+
+    try:
+        token = CancellationToken()
+        if cancel_before_link:
+            token.cancel()
+
+        future = loop.create_future()
+        token.link_future(future)
+        callback_ran = asyncio.Event()
+        callback_thread: list[int] = []
+
+        def on_done(_: asyncio.Future[None]) -> None:
+            callback_thread.append(threading.get_ident())
+            callback_ran.set()
+
+        future.add_done_callback(on_done)
+
+        async def wait_for_future() -> None:
+            await future
+
+        waiter = asyncio.create_task(wait_for_future())
+        thread_errors: list[BaseException] = []
+
+        if not cancel_before_link:
+
+            def cancel_from_worker() -> None:
+                try:
+                    token.cancel()
+                except BaseException as exc:
+                    thread_errors.append(exc)
+
+            worker = threading.Thread(target=cancel_from_worker)
+            worker.start()
+            await asyncio.to_thread(worker.join)
+
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        await asyncio.wait_for(callback_ran.wait(), timeout=1)
+
+        assert thread_errors == []
+        assert callback_thread == [threading.get_ident()]
+    finally:
+        loop.set_debug(was_debug)
+
+
+def test_link_future_after_loop_closes_does_not_raise() -> None:
+    loop = asyncio.new_event_loop()
+    future = loop.create_future()
+    future.add_done_callback(lambda _: None)
+    token = CancellationToken()
+    token.link_future(future)
+
+    loop.close()
+
+    token.cancel()
+
+    assert not future.cancelled()
